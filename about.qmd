@@ -1,0 +1,12 @@
+---
+title: "About"
+image: profile.jpg
+about:
+  template: jolla
+  links:
+    - icon: github
+      text: GitHub
+      href: https://github.com/bruno-hays
+---
+
+Machine learning engineer. This blog collects interesting things I have worked on.

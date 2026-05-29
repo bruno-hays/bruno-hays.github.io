@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss  xmlns:atom="http://www.w3.org/2005/Atom" 
+      xmlns:media="http://search.yahoo.com/mrss/" 
+      xmlns:content="http://purl.org/rss/1.0/modules/content/" 
+      xmlns:dc="http://purl.org/dc/elements/1.1/" 
+      version="2.0">
+<channel>
+<title>Bruno Hays</title>
+<link>https://bruno-hays.github.io/</link>
+<atom:link href="https://bruno-hays.github.io/index.xml" rel="self" type="application/rss+xml"/>
+<description>Notes from a machine learning engineer</description>
+<generator>quarto-1.11.9</generator>
+<lastBuildDate>Thu, 28 May 2026 22:00:00 GMT</lastBuildDate>
+<item>
+  <title>Real-time multilingual ASR: route between small models</title>
+  <dc:creator>Bruno Hays</dc:creator>
+  <link>https://bruno-hays.github.io/posts/realtime-multilingual-asr-router/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+<p>Real-time speech recognition struggles with language switches. After a switch, models tend to produce gibberish until they register the new language, translate instead of transcribing, or drop whole passages. The usual fix is a bigger multilingual model, but every added language pushes it further out of reach of CPU-only deployments.</p>
+<p>This is a small proof of concept that goes the other way: <strong>route between small monolingual streaming models</strong> and let a coordinator deal with the switches. Code: <a href="https://github.com/gladiaio/realtime-multilingual-asr-router">realtime-multilingual-asr-router</a>.</p>
+<p>Demo video: <a href="https://www.youtube.com/watch?v=zNds-EIDwWo">watch the walkthrough</a>, with the live demo at <a href="https://www.youtube.com/watch?v=zNds-EIDwWo&amp;t=190s">3:10</a>.</p>
+<section id="architecture" class="level2">
+<h2 class="anchored" data-anchor-id="architecture">Architecture</h2>
+<p>Three open-source pieces, all lightweight and built to run on edge devices:</p>
+<ul>
+<li><strong>Streaming ASR</strong>: Zipformer transducers of about 100M parameters each. The models come from <a href="https://huggingface.co/Banafo/Kroko-ASR/tree/main">KrokoAI</a> for en/fr/es/de/it/pt/nl, plus a Vosk-based model for Russian, all run through sherpa-onnx.</li>
+<li><strong>VAD</strong>: Silero, to find speech boundaries.</li>
+<li><strong>Language ID (LID)</strong>: SpeechBrain ECAPA-TDNN (VoxLingua107), also small and CPU-friendly.</li>
+</ul>
+<p>Because every component is that light, this is a way to get multilingual real-time transcription on edge hardware, with no GPU and no large model to fit in memory.</p>
+<p>The coordinator keeps the audio buffered, watches boundaries, and can re-run a segment when the language changes.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="https://raw.githubusercontent.com/gladiaio/realtime-multilingual-asr-router/main/assets/01_baseline_black_frame.svg" class="img-fluid figure-img"></p>
+<figcaption>Architecture of the router: streaming ASR models, VAD, language ID and the coordinator that keeps the audio buffered.</figcaption>
+</figure>
+</div>
+</section>
+<section id="rollback" class="level2">
+<h2 class="anchored" data-anchor-id="rollback">Rollback</h2>
+<ol type="1">
+<li>Audio goes straight to the current ASR model. We never wait for language ID before showing text.</li>
+<li>In the background, LID runs on growing windows of audio since the last VAD boundary.</li>
+<li>If the detected language differs from the current one and confidence crosses a threshold, swap the ASR model, <strong>roll back to the last VAD boundary</strong>, and re-infer the buffered audio.</li>
+<li>After a set duration of silence, emit a final, always produced by the right model.</li>
+</ol>
+<p>The price is a few wrong-language partials that get replaced within moments. Finals have clean language boundaries. Rollback is cheap because the models are tiny and the buffer never spans more than one segment.</p>
+</section>
+<section id="results" class="level2">
+<h2 class="anchored" data-anchor-id="results">Results</h2>
+<p>The table shows word error rate in percent, so lower is better. Deepgram and ElevenLabs are mature production cloud APIs. The only open alternative I compared against is Voxtral Mini 4B Realtime, which has about 40 times more parameters than the models used here.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th>Voxtral Mini 4B</th>
+<th>Deepgram Nova-3</th>
+<th>ElevenLabs Scribe v2</th>
+<th>This work</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Monolingual (FLEURS, avg)</td>
+<td>6.5</td>
+<td>9.7</td>
+<td>4.4</td>
+<td>9.8</td>
+</tr>
+<tr class="even">
+<td>Code-switching between utterances</td>
+<td>21.3</td>
+<td>14.3</td>
+<td>13.6</td>
+<td><strong>13.2</strong></td>
+</tr>
+<tr class="odd">
+<td>Code-switching inside an utterance (Miami)</td>
+<td>76.3</td>
+<td>28.6</td>
+<td>26.5</td>
+<td>41.0</td>
+</tr>
+</tbody>
+</table>
+<p>On monolingual speech, ElevenLabs and Voxtral are stronger and Deepgram is on par, which is what to expect from models of about 100M parameters. On switches <em>between</em> utterances, the router is ahead of every system tested, because it transcribes each side with its own specialist model and re-runs a segment as soon as the language changes.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="https://raw.githubusercontent.com/gladiaio/realtime-multilingual-asr-router/main/assets/code-switching.png" class="img-fluid figure-img"></p>
+<figcaption>Word error rate on code-switching test sets for the router and the compared systems.</figcaption>
+</figure>
+</div>
+</section>
+<section id="where-it-breaks" class="level2">
+<h2 class="anchored" data-anchor-id="where-it-breaks">Where it breaks</h2>
+<p>Language switches inside a sentence, like Spanglish, happen faster than the VAD can find a boundary. Rollback rarely fires, so the wrong model is often used, which explains the 41% above. That is still far ahead of the open alternative, Voxtral, at 76%, even if the cloud APIs do better. I think these cases need their own specialized models, one for Spanglish, one for Singlish, and so on, rather than a smarter router.</p>
+</section>
+<section id="scaling-to-more-languages" class="level2">
+<h2 class="anchored" data-anchor-id="scaling-to-more-languages">Scaling to more languages</h2>
+<p>Adding a language only means dropping in another public model. Any online transducer supported by sherpa-onnx works, so the approach can cover many languages without growing any single model or its per-stream CPU cost.</p>
+
+
+</section>
+
+ ]]></description>
+  <guid>https://bruno-hays.github.io/posts/realtime-multilingual-asr-router/</guid>
+  <pubDate>Thu, 28 May 2026 22:00:00 GMT</pubDate>
+  <media:content url="https://raw.githubusercontent.com/gladiaio/realtime-multilingual-asr-router/main/assets/code-switching.png" medium="image" type="image/png"/>
+</item>
+</channel>
+</rss>

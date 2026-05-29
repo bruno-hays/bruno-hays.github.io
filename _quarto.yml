@@ -1,0 +1,22 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  description: "Notes from a machine learning engineer"
+  site-url: https://bruno-hays.github.io
+  title: "Bruno Hays"
+  navbar:
+    right:
+      - about.qmd
+      - icon: github
+        href: https://github.com/bruno-hays
+format:
+  html:
+    theme:
+      - cosmo
+      - brand
+    css: styles.css
+
+
+
