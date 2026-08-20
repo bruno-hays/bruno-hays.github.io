@@ -10,7 +10,299 @@
 <atom:link href="https://bruno-hays.github.io/index.xml" rel="self" type="application/rss+xml"/>
 <description>Notes from a machine learning engineer</description>
 <generator>quarto-1.11.9</generator>
-<lastBuildDate>Thu, 28 May 2026 22:00:00 GMT</lastBuildDate>
+<lastBuildDate>Wed, 19 Aug 2026 22:00:00 GMT</lastBuildDate>
+<item>
+  <title>How to fix dictated email addresses lost in real transcripts, at the cost of a few tokens per address</title>
+  <dc:creator>Bruno Hays</dc:creator>
+  <link>https://bruno-hays.github.io/posts/email-reconstruction-cascade/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+<p>On phone calls, people dictate their email address the way they would to another person: they spell it, correct themselves, give digits and separators as words. A speech recognizer returns the words it heard, and turning them into an address is a separate problem.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>What the caller says</th>
+<th>What the customer wants</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>“jeanne tiret du 8 dupont, d u p o n d, arobase gmail point com”</td>
+<td><code>jeanne_dupond@gmail.com</code></td>
+</tr>
+<tr class="even">
+<td>“it’s m i c h e l l e at hotmail dot com”</td>
+<td><code>michelle@hotmail.com</code></td>
+</tr>
+<tr class="odd">
+<td>“john dot smith at yahoo, no sorry, gmail dot com”</td>
+<td><code>john.smith@gmail.com</code></td>
+</tr>
+<tr class="even">
+<td>“michel with two l, at hotmail dot com”</td>
+<td><code>michelle@hotmail.com</code></td>
+</tr>
+<tr class="odd">
+<td>“yes that’s still the same one, sarah at the company”</td>
+<td>not recoverable</td>
+</tr>
+</tbody>
+</table>
+<p>About half of the real calls fall in that last category: the address cannot be recovered from the transcript. On the recoverable ones, a simple regexp on the transcript, which is what a client would naturally try, recovers around half. This post is about getting to roughly the accuracy of a large LLM reading the same transcript, at a cost small enough to run in production.</p>
+<section id="two-ways-to-extract-the-address" class="level2">
+<h2 class="anchored" data-anchor-id="two-ways-to-extract-the-address">Two ways to extract the address</h2>
+<p>We worked with Qwen3-ASR-1.7B. There are two ways to turn its transcript into an address:</p>
+<ul>
+<li><strong>A regexp.</strong> Cheap and instant, but it only finds addresses the ASR already wrote as <code>x@y.z</code>. Spelled letters, spoken separators, corrections and mnemonics all break it.</li>
+<li><strong>A large LLM</strong> that reads the transcript, understands the quirks and reconstructs the address. It works much better, and it is too expensive to run on every utterance of every call.</li>
+</ul>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="https://bruno-hays.github.io/posts/email-reconstruction-cascade/oob_accuracy.png" class="img-fluid figure-img"></p>
+<figcaption>Exact-match accuracy on dictated email addresses: the regexp and the paid ASR APIs reach 24 to 35%, the cascade 42% and the large LLM 45%.</figcaption>
+</figure>
+</div>
+<p>The large LLM gets 45%. That is <strong>what we are trying to match</strong>, and it is close to the best that reading the transcript can do. It is not 100% because a large part of the calls are ambiguous. Often the speaker is only confirming an address the other person already has, as in the last example, or the domain name of a company is spelled in a way no model can guess. Neither the ASR nor a human annotator has the context to know the exact address.</p>
+<p>The goal was therefore to get as close as possible to the large LLM at the lowest possible cost. The cascade below recovers 42%, which is 16 of the 19 points between the regexp and the ceiling, and runs the LLM on only 4% of the traffic, when about 2% of it actually contains an email.</p>
+</section>
+<section id="the-data" class="level2">
+<h2 class="anchored" data-anchor-id="the-data">The data</h2>
+<ul>
+<li><strong>Source.</strong> We sifted millions of transcriptions of real calls, used with user consent for model improvement, to find calls where an email is spelled out. Each sample holds at least one dictated address, with 30 seconds to a minute of audio around it.</li>
+<li><strong>Test set.</strong> 576 calls in six languages (French, English, Spanish, German, Portuguese, Italian), each with a human annotation of the exact address.</li>
+<li><strong>Training targets.</strong> About 11,000 real transcripts with a dictated address, disjoint from the test set, with pseudo annotations: the address is produced by Kimi K3. For the reconstructor we keep the roughly 4,000 where Gemini 3.7 Flash produces the same address.</li>
+<li><strong>Filter test set.</strong> 10,000 random calls, representative of the traffic, of which about 200 contain a dictated address. It is only used to measure the precision and recall of the cheap filters.</li>
+<li><strong>Metric.</strong> Exact match after lowercasing.</li>
+</ul>
+</section>
+<section id="making-the-llm-affordable-a-cascade" class="level2">
+<h2 class="anchored" data-anchor-id="making-the-llm-affordable-a-cascade">Making the LLM affordable: a cascade</h2>
+<p>Each stage is far cheaper than the next and tuned for recall, so an address is not lost on the way.</p>
+<pre><code>100%  of transcripts
+  80% stop at the regexp: no email cue
+  20% go to the NER tagger
+        16% stop at the decision rule
+         4% reach the LLM</code></pre>
+<p><strong>1. Regexp pre-gate.</strong> It looks for a domain, an “at” word, an <code>@</code> or a “dot” word in several languages. On the filter test set it keeps 96% of the real addresses and sends only 20% of transcripts onward.</p>
+<p><strong>2. NER tagger.</strong> A multilingual mDeBERTa-v3 model types every fragment of the transcript with 14 labels: local part, <code>@</code>, provider, TLD, spelled letter, phonetic mnemonic (“a wie Anton”), digits, separator, self-correction, and so on.</p>
+<p>A simple rule on the predicted tags decides whether an address is really being dictated. On the same filter test set it keeps every address and lets only 4% of transcripts through to the LLM.</p>
+<p><strong>3. Crop.</strong> Thanks to the tags, the LLM can focus on the part of the call that contains the email: it only sees the tagged region and a few words around it. A 1,000-word call becomes about 30 words, which shrinks the prompt and the prefill time of every LLM call. When two addresses are far apart, the transcript is split and each part is processed separately. About 9% of calls contain two addresses, which a classifier detects before the LLM.</p>
+<p><strong>4. LLM reconstructor.</strong> It assembles the address from the cropped text and the typed fragments.</p>
+<section id="training-the-tagger" class="level3">
+<h3 class="anchored" data-anchor-id="training-the-tagger">Training the tagger</h3>
+<p>The tagger is trained on the training targets above. Kimi K3 gets the transcript and the address, and marks which words produce each part of it; the marks become token labels. The first versions raised false alarms on website URLs, so we re-tagged the training set with a <code>WEBSITE</code> label (about 1,000 spans) to keep them out of the address. We then added a few hundred real transcripts that mention an email without giving an address, left untagged, as negatives. Together they <strong>cut the false-positive rate from 22% to 2%</strong>, a bigger gain than anything else we tried. The final tagger reaches a span F1 of 0.78 against the pseudo annotations.</p>
+</section>
+</section>
+<section id="choosing-the-reconstructor" class="level2">
+<h2 class="anchored" data-anchor-id="choosing-the-reconstructor">Choosing the reconstructor</h2>
+<p>We compared nine models without fine-tuning (a selection is shown), all given the same cropped text and the tags predicted by the NER tagger, on exact match against the human annotation.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Model</th>
+<th>Exact match</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Qwen3.5 0.8B</td>
+<td>12%</td>
+</tr>
+<tr class="even">
+<td>Qwen3.5 2B</td>
+<td>28%</td>
+</tr>
+<tr class="odd">
+<td>Qwen3.5 4B</td>
+<td>35%</td>
+</tr>
+<tr class="even">
+<td>Gemma3 12B</td>
+<td>37%</td>
+</tr>
+<tr class="odd">
+<td>Qwen3.5 9B</td>
+<td>40%</td>
+</tr>
+<tr class="even">
+<td>Qwen3.8 27B</td>
+<td>43%</td>
+</tr>
+<tr class="odd">
+<td>Kimi K3 (the target)</td>
+<td>45%</td>
+</tr>
+</tbody>
+</table>
+<p>Accuracy climbs with size up to about 9B and then flattens. Fine-tuning small models brought little, and could even hurt, so we stayed with prompting. Our baseline prompts were optimized with DSPy’s MIPROv2, which tunes the instruction and the few-shot demonstrations, on 200 balanced multilingual examples (40 per language) scored against the pseudo annotations.</p>
+<section id="the-smallest-model-that-works-is-not-the-cheapest" class="level3">
+<h3 class="anchored" data-anchor-id="the-smallest-model-that-works-is-not-the-cheapest">The smallest model that works is not the cheapest</h3>
+<p>The obvious pick is the smallest model that is accurate enough. That was our initial choice: a 9B model that reasons in a chain of thought. It wrote about 565 tokens per call, and sometimes ran out before reaching the answer. Output tokens dominate the cost and latency of a call, so we compared the options in accuracy and in tokens:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Reconstructor</th>
+<th>Exact match</th>
+<th>Tokens per call</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Kimi K3 (the target)</td>
+<td>45%</td>
+<td>167</td>
+</tr>
+<tr class="even">
+<td>9B, chain of thought</td>
+<td>39%</td>
+<td>565</td>
+</tr>
+<tr class="odd">
+<td>27B, rules only, no reasoning</td>
+<td>35%</td>
+<td>12</td>
+</tr>
+<tr class="even">
+<td>27B, rules only, native reasoning</td>
+<td>41%</td>
+<td>450</td>
+</tr>
+<tr class="odd">
+<td>27B, chain-of-thought prompt with harvested reasoning, native thinking off</td>
+<td>43%</td>
+<td>245</td>
+</tr>
+<tr class="even">
+<td>27B, answer-first prompt, native thinking off</td>
+<td>42%</td>
+<td>12</td>
+</tr>
+</tbody>
+</table>
+<p>With the right prompt, a 27B model is more accurate than the 9B and writes about 45 times fewer output tokens. The next section shows how we got there.</p>
+</section>
+<section id="teaching-the-model-to-reason-without-paying-for-it" class="level3">
+<h3 class="anchored" data-anchor-id="teaching-the-model-to-reason-without-paying-for-it">Teaching the model to reason without paying for it</h3>
+<p><strong>Step 0: rules only.</strong> The prompt is a list of decoding rules and an instruction to output only the address:</p>
+<pre><code>Reconstruct the EXACT email address dictated in an ASR phone transcript,
+using the typed NER spans. Apply these rules in order:
+1. SPELLED LETTERS OVERRIDE: a spelled sequence ("d u p o n d") gives the exact
+   letters and REPLACES the spoken word it clarifies.
+3. DOUBLING: "with two l" doubles that letter, or confirms it is already double.
+4. KEYBOARD IDIOMS: "tiret du 8" -&gt; '_'. NEVER keep the digit.
+5. NO CONVENTION DOT: join name parts with no separator unless a separator word
+   is spoken. A '.' only when a dot-word is said.
+...
+Output the final lowercase email address.</code></pre>
+<p>Without reasoning, the model scores only 35%: it is fragile on a few dictation conventions:</p>
+<ul>
+<li>a spelled name overrides the spoken one (“dupont… d u p o n d” gives <code>dupond</code>)</li>
+<li>“tiret du 8” means the underscore key</li>
+<li>“michel with two l” implies a trailing e: <code>michelle</code></li>
+<li>separators: models invent a dot between first and last name, or drop one that was spoken</li>
+</ul>
+<p><strong>Native thinking handles them and brings accuracy to 41%, but it costs 450 tokens per call.</strong></p>
+<p><strong>Step 1: harvest the reasoning.</strong> We wrote 8 short dictations by hand, each exercising one of these idioms (spelled override, mnemonic letter, doubling, keyboard idiom, concatenation), ran the model on them with native thinking on, and kept only the reasoning traces that led to the correct address. Because they come from the model itself, the reasoning matches its own style. The prompt changes in two places: the instruction now asks for a short reasoning before the address, and the harvested traces are added as few-shot demonstrations of a classic chain of thought. <strong>Native thinking is switched off:</strong></p>
+<pre><code>Transcript: c est dupont épelé d u p o n d arobase gmail point com
+NER spans: LOCAL=dupont épelé | SPELLING=d u p o n d | AT=arobase | PROVIDER=gmail | SEP=point | TLD=com
+
+reasoning: "dupont épelé d u p o n d": by rule 1 the spelling overrides the spoken
+word, so the local part is "dupond". "arobase" -&gt; @, "point" -&gt; '.'.
+email: dupond@gmail.com</code></pre>
+<p>Accuracy went up to 43% and the output fell from 450 to 245 tokens.</p>
+<p><strong>Step 2: answer first.</strong> The demonstrations keep the same harvested reasoning, but the order is inverted, and the instruction changes accordingly:</p>
+<pre><code>FIRST output the final lowercase email address, THEN on the next line write
+'reason:' followed by a brief reason.</code></pre>
+<pre><code>dupond@gmail.com
+reason: "dupont épelé d u p o n d": by rule 1 the spelling overrides the spoken
+word, so the local part is "dupond". "arobase" -&gt; @, "point" -&gt; '.'.</code></pre>
+<p>At inference the model writes the address first and generation is stopped right after it, so the reason is never generated. It only lives in the prompt, where it teaches the rule by example. That removes the thinking tokens: only the 12 tokens of the address remain, for a one-point loss in accuracy, and the hard idioms stay stable.</p>
+<p><strong>LLM-based reconstruction limitation.</strong> LLMs read tokens, not letters, which is why they famously cannot count the “r” in strawberry. The same blind spot limits how well they fix a spelling, for instance deciding that “Remi” is written with a Y. With real reasoning a model can work around it by first writing the word letter by letter, and native thinking does this to some extent. Our answer-first prompt gives up that step, and we observed it is significantly worse on these cases. We deemed the balance to be in favour of the no-thinking version: such samples are rare in our real data, and even with thinking on the model is far from perfect.</p>
+</section>
+</section>
+<section id="results" class="level2">
+<h2 class="anchored" data-anchor-id="results">Results</h2>
+<p>End to end, with the NER predicting its own tags, exact match against the human annotation on the 576 calls:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Language</th>
+<th>Regexp</th>
+<th>Our cascade</th>
+<th>Kimi K3 (target)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>French</td>
+<td>10%</td>
+<td>38%</td>
+<td>41%</td>
+</tr>
+<tr class="even">
+<td>German</td>
+<td>17%</td>
+<td>38%</td>
+<td>41%</td>
+</tr>
+<tr class="odd">
+<td>Spanish</td>
+<td>26%</td>
+<td>37%</td>
+<td>40%</td>
+</tr>
+<tr class="even">
+<td>Portuguese</td>
+<td>31%</td>
+<td>39%</td>
+<td>42%</td>
+</tr>
+<tr class="odd">
+<td>Italian</td>
+<td>32%</td>
+<td>47%</td>
+<td>50%</td>
+</tr>
+<tr class="even">
+<td>English</td>
+<td>51%</td>
+<td>60%</td>
+<td>63%</td>
+</tr>
+<tr class="odd">
+<td><strong>All</strong></td>
+<td><strong>26%</strong></td>
+<td><strong>42%</strong></td>
+<td><strong>45%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The cascade is 16 points above the regexp and 3 below the target. The gain is largest where spelling conventions are hardest and a regexp does worst: French goes from 10% to 38%.</p>
+</section>
+<section id="inline-replacement" class="level2">
+<h2 class="anchored" data-anchor-id="inline-replacement">Inline replacement</h2>
+<p>Because the tagger gives the position of every fragment, the reconstructed address replaces only the dictated words in the transcript, and the rest of the call is untouched. On calls without any email (averaging 10 minutes), the change in word error rate is 0.003%, and only 0.1% of them get a wrong replacement. On calls with an email, the spelled fragments, about 4 words at the median, collapse into one address token.</p>
+
+
+</section>
+
+ ]]></description>
+  <guid>https://bruno-hays.github.io/posts/email-reconstruction-cascade/</guid>
+  <pubDate>Wed, 19 Aug 2026 22:00:00 GMT</pubDate>
+</item>
 <item>
   <title>Real-time multilingual ASR: route between small models</title>
   <dc:creator>Bruno Hays</dc:creator>
