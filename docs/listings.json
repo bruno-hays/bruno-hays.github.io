@@ -2,6 +2,7 @@
   {
     "listing": "/index.html",
     "items": [
+      "/posts/qwen3-asr-phone-numbers/index.html",
       "/posts/email-reconstruction-cascade/index.html",
       "/posts/realtime-multilingual-asr-router/index.html"
     ]

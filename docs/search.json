@@ -7,6 +7,83 @@
     "text": "Machine learning engineer. This blog collects interesting things I have worked on."
   },
   {
+    "objectID": "posts/qwen3-asr-phone-numbers/index.html",
+    "href": "posts/qwen3-asr-phone-numbers/index.html",
+    "title": "Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting",
+    "section": "",
+    "text": "On real phone calls in seven languages, Qwen3-ASR-1.7B gets 29% of the phone numbers wrong, against 23% for AssemblyAI and 21% for ElevenLabs.\nThis post is about closing that gap. The main challenge was improving digit recognition without degrading everyday speech transcription. Two attempts with reinforcement learning were unsuccessful. What worked is a masked supervised fine-tuning (SFT) on corrected transcripts, followed by a re-distillation of the original model. I end with a model that is on par with ElevenLabs on phone numbers and on par with the original model on everyday word error rate (WER)."
+  },
+  {
+    "objectID": "posts/qwen3-asr-phone-numbers/index.html#data-and-metric",
+    "href": "posts/qwen3-asr-phone-numbers/index.html#data-and-metric",
+    "title": "Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting",
+    "section": "Data and metric",
+    "text": "Data and metric\nTest set. We sifted millions of transcriptions of real calls, used with user consent for model improvement, to curate calls that contain at least one phone number, each with 30 seconds to a minute of audio around it. The calls were transcribed by humans. The set holds about 425 clips in seven languages.\nMetric. WER is the wrong tool here: one wrong digit makes a number useless. Moreover, real calls are messy: people get interrupted while spelling, repeat parts and correct themselves. So an LLM (Gemini 2.5 Flash) extracts the phone numbers from the transcript. The score is binary: a number is either exactly the reference or wrong.\nForgetting. To measure forgetting, we track WER on dozens of public and internal datasets, in the same seven languages.\nTraining data. It comes from the same real calls, and every call of the test set is excluded. A named entity recognition (NER) model found the phone numbers, and the audio was cut into short clips around them. The pseudo annotations differ across the experiments below."
+  },
+  {
+    "objectID": "posts/qwen3-asr-phone-numbers/index.html#first-attempts-with-rl",
+    "href": "posts/qwen3-asr-phone-numbers/index.html#first-attempts-with-rl",
+    "title": "Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting",
+    "section": "First attempts with RL",
+    "text": "First attempts with RL\nI started with reinforcement learning for two reasons. First, GRPO (Group Relative Policy Optimization) has been shown to improve WER (Shivakumar et al.), and to make the decoder rely more on the audio: Kumar et al. find that it keeps attention anchored to the audio and cuts insertions, which suits digits that are spelled out. Second, RL is known to forget less than SFT, because it only trains on the model’s own samples and mostly reshapes behaviour the model already has, whereas SFT pulls the model towards the training data (see this post for a good discussion). Forgetting being the main constraint, this looked like the right tool.\n\nAttempt 1: RL against ElevenLabs transcripts\nThe first idea was to use ElevenLabs as the teacher: GRPO with the whole-clip WER against its transcripts as the reward, on about 11,000 clips of 7 to 11 seconds.\nIt worked on the reward: the WER against ElevenLabs on a dev set fell from 44% to 31%. It did not work on the goal. The model learned ElevenLabs’ style while its digits stayed the same: phone errors went from 29.1% to 29.0%. A whole-clip reward is dominated by the hundreds of tokens that are not digits, so that is what the policy optimizes. On the plus side, nothing was forgotten (English WER on the generalist set went from 7.6% to 7.7%).\n\n\nAttempt 2: RL with a reward that targets digits\nSo I made the reward about the digits: the whole-clip term plus a term on the character error rate of the phone-number spans, found with an NER model, and with advantages normalized per term so the dense WER term could not drown the sparse digit one. The reference was now the ElevenLabs transcript corrected by Gemini.\nBefore launching, I measured what this reward could do:\n\nAgainst an LLM judge, it ranked pairs of hypotheses correctly about two thirds of the time. Noisy, but usable.\nOffline, the base model gets an exact number in 12% of its samples at k=1 and in 35% of the prompts when taking the best of 32. A small headroom, but a seemingly usable one.\n\nThe run stayed flat, with phone errors at 31.2% before and after. The best-of-32 figure explains why: it means that for about two thirds of the prompts, none of the 32 samples is correct, and those prompts give no gradient. An overfit test on 8 prompts confirmed it: even with 32 samples per prompt, 6 of 8 prompts never produced a single correct number. The headroom was concentrated on a third of the prompts, too thin to learn from at this small scale.\nThe sharper way to see it: plain SFT on the same kind of data reached 40% exact numbers in greedy decoding, above the best of 32 samples from the base model (35%). This means we need to go beyond sharpening the model and expand its capabilities, and that is where SFT comes in."
+  },
+  {
+    "objectID": "posts/qwen3-asr-phone-numbers/index.html#masked-splice-sft",
+    "href": "posts/qwen3-asr-phone-numbers/index.html#masked-splice-sft",
+    "title": "Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting",
+    "section": "Masked splice-SFT",
+    "text": "Masked splice-SFT\nThe RL rollouts were not informative enough: the model rarely produced a correct number, so there was not enough to reinforce. The distribution of the model itself had to change, and that takes SFT. The challenge is that naive SFT rewrites the whole sentence, which is where forgetting comes from. The recipe that worked:\n\nHard pool. Out of about 90,000 clips cut from our training set, we kept the 55,000 where Qwen3-ASR and ElevenLabs disagree on the number.\nTarget. Qwen3-ASR’s own transcript, in which Gemini 3.8 Flash, listening to the audio, fixed only the phone-number spans. This teacher reaches 19.8% phone errors on the test set, on par with ElevenLabs, which is why it makes a good target.\nMasked loss. Only the tokens of the fixed spans are trained on.\n\nThe targets are near on-policy, so there is almost nothing to learn outside the spans.\nI then tried three variants, all evaluated on phone errors and everyday WER:\n\nDecoder LoRA only. Phone errors fall from 28.0% to 23.4%, and everyday WER stays flat. It plateaued there whatever I changed: the encoder is what hears the digits.\nDecoder + audio-encoder LoRA. Phone errors fall to 21.1%, but everyday WER rises to 19.4%, with repetition loops on some languages.\nDecoder + encoder, then re-distillation. The encoder LoRA brings the phone-number gains but damages everyday transcription. To repair it, a second short stage (300 steps) starts from that model and freezes the audio LoRA, so the gains are kept. It trains only the decoder LoRA to imitate the original model on 8,000 real clips (100 hours) that contain no numbers: a KL divergence loss pulls its output, token by token, towards the output of the original model run on the same clip. Phone errors stay at 20.9% and everyday WER is back to 16.2%. Doing the same thing during the number training instead froze the gains at 25.1%."
+  },
+  {
+    "objectID": "posts/qwen3-asr-phone-numbers/index.html#results",
+    "href": "posts/qwen3-asr-phone-numbers/index.html#results",
+    "title": "Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting",
+    "section": "Results",
+    "text": "Results\n\n\n\n\n\n\n\n\nPhone-number test set\nPhone errors\nEveryday WER (internal datasets)\n\n\n\n\nQwen3-ASR-1.7B (original)\n28.0%\n16.6%\n\n\nElevenLabs\n20.7%\n\n\n\nGemini 3.8 Flash, fixing the transcript with the audio\n19.8%\n\n\n\nSFT, decoder only\n23.4%\n16.8%\n\n\nSFT, decoder + audio encoder\n21.1%\n19.4%\n\n\nSFT, decoder + audio encoder + re-distillation\n20.9%\n16.2%\n\n\n\nThe final model is on par with ElevenLabs on phone numbers and with the original model on everyday WER. In the end RL was not even needed: the recipe that works contains none.\nOn our full test suite, which comprises more than 40 public and internal datasets in the seven languages, the final model is flat overall. WER per language, original model vs final model:\n\n\n\n\n\n\n\n\n\n\nLanguage\nPublic, original\nPublic, final\nInternal, original\nInternal, final\n\n\n\n\nEnglish\n5.9%\n6.0%\n7.6%\n7.8%\n\n\nFrench\n11.2%\n11.2%\n16.4%\n16.2%\n\n\nItalian\n7.9%\n8.1%\n18.3%\n18.4%\n\n\nSpanish\n4.6%\n4.8%\n12.7%\n12.9%\n\n\nGerman\n7.7%\n8.0%\n16.0%\n16.1%\n\n\nPortuguese\n8.3%\n8.7%\n16.8%\n16.9%\n\n\nDutch\n9.1%\n9.6%\n28.1%\n25.3%\n\n\nAverage, 7 languages\n7.8%\n8.1%\n16.6%\n16.2%\n\n\nRussian (not in training)\n5.2%\n5.2%\n\n\n\n\n\nThe degradation is very small, at most 0.5 points per language on the public datasets. Russian was not part of the training and does not move at all, which shows the model did not forget outside the languages it was trained on."
+  },
+  {
+    "objectID": "posts/realtime-multilingual-asr-router/index.html",
+    "href": "posts/realtime-multilingual-asr-router/index.html",
+    "title": "Real-time multilingual ASR: route between small models",
+    "section": "",
+    "text": "Real-time speech recognition struggles with language switches. After a switch, models tend to produce gibberish until they register the new language, translate instead of transcribing, or drop whole passages. The usual fix is a bigger multilingual model, but every added language pushes it further out of reach of CPU-only deployments.\nThis is a small proof of concept that goes the other way: route between small monolingual streaming models and let a coordinator deal with the switches. Code: realtime-multilingual-asr-router.\nDemo video: watch the walkthrough, with the live demo at 3:10."
+  },
+  {
+    "objectID": "posts/realtime-multilingual-asr-router/index.html#architecture",
+    "href": "posts/realtime-multilingual-asr-router/index.html#architecture",
+    "title": "Real-time multilingual ASR: route between small models",
+    "section": "Architecture",
+    "text": "Architecture\nThree open-source pieces, all lightweight and built to run on edge devices:\n\nStreaming ASR: Zipformer transducers of about 100M parameters each. The models come from KrokoAI for en/fr/es/de/it/pt/nl, plus a Vosk-based model for Russian, all run through sherpa-onnx.\nVAD: Silero, to find speech boundaries.\nLanguage ID (LID): SpeechBrain ECAPA-TDNN (VoxLingua107), also small and CPU-friendly.\n\nBecause every component is that light, this is a way to get multilingual real-time transcription on edge hardware, with no GPU and no large model to fit in memory.\nThe coordinator keeps the audio buffered, watches boundaries, and can re-run a segment when the language changes.\n\n\n\nArchitecture of the router: streaming ASR models, VAD, language ID and the coordinator that keeps the audio buffered."
+  },
+  {
+    "objectID": "posts/realtime-multilingual-asr-router/index.html#rollback",
+    "href": "posts/realtime-multilingual-asr-router/index.html#rollback",
+    "title": "Real-time multilingual ASR: route between small models",
+    "section": "Rollback",
+    "text": "Rollback\n\nAudio goes straight to the current ASR model. We never wait for language ID before showing text.\nIn the background, LID runs on growing windows of audio since the last VAD boundary.\nIf the detected language differs from the current one and confidence crosses a threshold, swap the ASR model, roll back to the last VAD boundary, and re-infer the buffered audio.\nAfter a set duration of silence, emit a final, always produced by the right model.\n\nThe price is a few wrong-language partials that get replaced within moments. Finals have clean language boundaries. Rollback is cheap because the models are tiny and the buffer never spans more than one segment."
+  },
+  {
+    "objectID": "posts/realtime-multilingual-asr-router/index.html#results",
+    "href": "posts/realtime-multilingual-asr-router/index.html#results",
+    "title": "Real-time multilingual ASR: route between small models",
+    "section": "Results",
+    "text": "Results\nThe table shows word error rate in percent, so lower is better. Deepgram and ElevenLabs are mature production cloud APIs. The only open alternative I compared against is Voxtral Mini 4B Realtime, which has about 40 times more parameters than the models used here.\n\n\n\n\n\n\n\n\n\n\n\nVoxtral Mini 4B\nDeepgram Nova-3\nElevenLabs Scribe v2\nThis work\n\n\n\n\nMonolingual (FLEURS, avg)\n6.5\n9.7\n4.4\n9.8\n\n\nCode-switching between utterances\n21.3\n14.3\n13.6\n13.2\n\n\nCode-switching inside an utterance (Miami)\n76.3\n28.6\n26.5\n41.0\n\n\n\nOn monolingual speech, ElevenLabs and Voxtral are stronger and Deepgram is on par, which is what to expect from models of about 100M parameters. On switches between utterances, the router is ahead of every system tested, because it transcribes each side with its own specialist model and re-runs a segment as soon as the language changes.\n\n\n\nWord error rate on code-switching test sets for the router and the compared systems."
+  },
+  {
+    "objectID": "posts/realtime-multilingual-asr-router/index.html#where-it-breaks",
+    "href": "posts/realtime-multilingual-asr-router/index.html#where-it-breaks",
+    "title": "Real-time multilingual ASR: route between small models",
+    "section": "Where it breaks",
+    "text": "Where it breaks\nLanguage switches inside a sentence, like Spanglish, happen faster than the VAD can find a boundary. Rollback rarely fires, so the wrong model is often used, which explains the 41% above. That is still far ahead of the open alternative, Voxtral, at 76%, even if the cloud APIs do better. I think these cases need their own specialized models, one for Spanglish, one for Singlish, and so on, rather than a smarter router."
+  },
+  {
+    "objectID": "posts/realtime-multilingual-asr-router/index.html#scaling-to-more-languages",
+    "href": "posts/realtime-multilingual-asr-router/index.html#scaling-to-more-languages",
+    "title": "Real-time multilingual ASR: route between small models",
+    "section": "Scaling to more languages",
+    "text": "Scaling to more languages\nAdding a language only means dropping in another public model. Any online transducer supported by sherpa-onnx works, so the approach can cover many languages without growing any single model or its per-stream CPU cost."
+  },
+  {
     "objectID": "posts/email-reconstruction-cascade/index.html",
     "href": "posts/email-reconstruction-cascade/index.html",
     "title": "How to fix dictated email addresses lost in real transcripts, at the cost of a few tokens per address",
@@ -56,52 +133,10 @@
     "text": "Inline replacement\nBecause the tagger gives the position of every fragment, the reconstructed address replaces only the dictated words in the transcript, and the rest of the call is untouched. On calls without any email (averaging 10 minutes), the change in word error rate is 0.003%, and only 0.1% of them get a wrong replacement. On calls with an email, the spelled fragments, about 4 words at the median, collapse into one address token."
   },
   {
-    "objectID": "posts/realtime-multilingual-asr-router/index.html",
-    "href": "posts/realtime-multilingual-asr-router/index.html",
-    "title": "Real-time multilingual ASR: route between small models",
-    "section": "",
-    "text": "Real-time speech recognition struggles with language switches. After a switch, models tend to produce gibberish until they register the new language, translate instead of transcribing, or drop whole passages. The usual fix is a bigger multilingual model, but every added language pushes it further out of reach of CPU-only deployments.\nThis is a small proof of concept that goes the other way: route between small monolingual streaming models and let a coordinator deal with the switches. Code: realtime-multilingual-asr-router.\nDemo video: watch the walkthrough, with the live demo at 3:10."
-  },
-  {
-    "objectID": "posts/realtime-multilingual-asr-router/index.html#architecture",
-    "href": "posts/realtime-multilingual-asr-router/index.html#architecture",
-    "title": "Real-time multilingual ASR: route between small models",
-    "section": "Architecture",
-    "text": "Architecture\nThree open-source pieces, all lightweight and built to run on edge devices:\n\nStreaming ASR: Zipformer transducers of about 100M parameters each. The models come from KrokoAI for en/fr/es/de/it/pt/nl, plus a Vosk-based model for Russian, all run through sherpa-onnx.\nVAD: Silero, to find speech boundaries.\nLanguage ID (LID): SpeechBrain ECAPA-TDNN (VoxLingua107), also small and CPU-friendly.\n\nBecause every component is that light, this is a way to get multilingual real-time transcription on edge hardware, with no GPU and no large model to fit in memory.\nThe coordinator keeps the audio buffered, watches boundaries, and can re-run a segment when the language changes.\n\n\n\nArchitecture of the router: streaming ASR models, VAD, language ID and the coordinator that keeps the audio buffered."
-  },
-  {
-    "objectID": "posts/realtime-multilingual-asr-router/index.html#rollback",
-    "href": "posts/realtime-multilingual-asr-router/index.html#rollback",
-    "title": "Real-time multilingual ASR: route between small models",
-    "section": "Rollback",
-    "text": "Rollback\n\nAudio goes straight to the current ASR model. We never wait for language ID before showing text.\nIn the background, LID runs on growing windows of audio since the last VAD boundary.\nIf the detected language differs from the current one and confidence crosses a threshold, swap the ASR model, roll back to the last VAD boundary, and re-infer the buffered audio.\nAfter a set duration of silence, emit a final, always produced by the right model.\n\nThe price is a few wrong-language partials that get replaced within moments. Finals have clean language boundaries. Rollback is cheap because the models are tiny and the buffer never spans more than one segment."
-  },
-  {
-    "objectID": "posts/realtime-multilingual-asr-router/index.html#results",
-    "href": "posts/realtime-multilingual-asr-router/index.html#results",
-    "title": "Real-time multilingual ASR: route between small models",
-    "section": "Results",
-    "text": "Results\nThe table shows word error rate in percent, so lower is better. Deepgram and ElevenLabs are mature production cloud APIs. The only open alternative I compared against is Voxtral Mini 4B Realtime, which has about 40 times more parameters than the models used here.\n\n\n\n\n\n\n\n\n\n\n\nVoxtral Mini 4B\nDeepgram Nova-3\nElevenLabs Scribe v2\nThis work\n\n\n\n\nMonolingual (FLEURS, avg)\n6.5\n9.7\n4.4\n9.8\n\n\nCode-switching between utterances\n21.3\n14.3\n13.6\n13.2\n\n\nCode-switching inside an utterance (Miami)\n76.3\n28.6\n26.5\n41.0\n\n\n\nOn monolingual speech, ElevenLabs and Voxtral are stronger and Deepgram is on par, which is what to expect from models of about 100M parameters. On switches between utterances, the router is ahead of every system tested, because it transcribes each side with its own specialist model and re-runs a segment as soon as the language changes.\n\n\n\nWord error rate on code-switching test sets for the router and the compared systems."
-  },
-  {
-    "objectID": "posts/realtime-multilingual-asr-router/index.html#where-it-breaks",
-    "href": "posts/realtime-multilingual-asr-router/index.html#where-it-breaks",
-    "title": "Real-time multilingual ASR: route between small models",
-    "section": "Where it breaks",
-    "text": "Where it breaks\nLanguage switches inside a sentence, like Spanglish, happen faster than the VAD can find a boundary. Rollback rarely fires, so the wrong model is often used, which explains the 41% above. That is still far ahead of the open alternative, Voxtral, at 76%, even if the cloud APIs do better. I think these cases need their own specialized models, one for Spanglish, one for Singlish, and so on, rather than a smarter router."
-  },
-  {
-    "objectID": "posts/realtime-multilingual-asr-router/index.html#scaling-to-more-languages",
-    "href": "posts/realtime-multilingual-asr-router/index.html#scaling-to-more-languages",
-    "title": "Real-time multilingual ASR: route between small models",
-    "section": "Scaling to more languages",
-    "text": "Scaling to more languages\nAdding a language only means dropping in another public model. Any online transducer supported by sherpa-onnx works, so the approach can cover many languages without growing any single model or its per-stream CPU cost."
-  },
-  {
     "objectID": "index.html",
     "href": "index.html",
     "title": "Articles",
     "section": "",
-    "text": "How to fix dictated email addresses lost in real transcripts, at the cost of a few tokens per address\n\n\n\n\n\n\n\n\n\n\nAug 20, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nReal-time multilingual ASR: route between small models\n\n\n\nStreaming ASR falls apart at language switches. Instead of scaling one multilingual model, route between ~100M monolingual ones and roll back when the language changes.\n\n\n\n\n\n\nMay 29, 2026\n\n\nBruno Hays\n\n\n\n\n\nNo matching items"
+    "text": "Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting\n\n\n\n\n\n\n\n\n\n\nOct 26, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nHow to fix dictated email addresses lost in real transcripts, at the cost of a few tokens per address\n\n\n\n\n\n\n\n\n\n\nAug 20, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nReal-time multilingual ASR: route between small models\n\n\n\nStreaming ASR falls apart at language switches. Instead of scaling one multilingual model, route between ~100M monolingual ones and roll back when the language changes.\n\n\n\n\n\n\nMay 29, 2026\n\n\nBruno Hays\n\n\n\n\n\nNo matching items"
   }
 ]
