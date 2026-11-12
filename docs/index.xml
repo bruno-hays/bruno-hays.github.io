@@ -10,7 +10,116 @@
 <atom:link href="https://bruno-hays.github.io/index.xml" rel="self" type="application/rss+xml"/>
 <description>Notes from a machine learning engineer</description>
 <generator>quarto-1.11.9</generator>
-<lastBuildDate>Sun, 25 Oct 2026 23:00:00 GMT</lastBuildDate>
+<lastBuildDate>Wed, 11 Nov 2026 23:00:00 GMT</lastBuildDate>
+<item>
+  <title>Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB</title>
+  <dc:creator>Bruno Hays</dc:creator>
+  <link>https://bruno-hays.github.io/posts/maeb-null-space-audio/</link>
+  <description><![CDATA[ 
+
+
+
+
+
+<p>Audio encoders aligned to text keep what was said and progressively throw away how it was said: the voice, the pitch, the emotion. That information is still there in their intermediate layers. To show it, I took <a href="https://huggingface.co/google/embeddinggemma-2">EmbeddingGemma-2</a> (577M parameters), which embeds text, images, video and audio in the same 768-dimensional space, and wrote features from two intermediate layers of its audio encoder into 256 dimensions that text never uses, without training a single weight.</p>
+<p>On <a href="https://mteb-leaderboard.hf.space/benchmark/MAEB(v1)">MAEB</a>, the 30-task audio benchmark of the MTEB leaderboard, the score goes from 49.3% to 54.4%. That moves the model from rank 16 to rank 1 on the full benchmark (from 26 to 1 on the audio-only one), ahead of 7B to 9B multimodal models.</p>
+<div class="quarto-figure quarto-figure-center">
+<figure class="figure">
+<p><img src="https://bruno-hays.github.io/posts/maeb-null-space-audio/maeb_scores.png" class="img-fluid figure-img"></p>
+<figcaption>MAEB macro average over 30 tasks: EmbeddingGemma-2 49.3%, e5-omni-7B 52.5%, LCO-Embedding-Omni-7B 53.5%, EmbeddingGemma-2 with the null-space head 54.4%.</figcaption>
+</figure>
+</div>
+<p>The rank partly reflects the benchmark. MAEB averages many acoustic tasks on which semantic embedders score close to zero, so any acoustic signal brings large gains.</p>
+<section id="semantics-aligned-audio-encoders-progressively-throw-away-paralinguistic-information" class="level2">
+<h2 class="anchored" data-anchor-id="semantics-aligned-audio-encoders-progressively-throw-away-paralinguistic-information">Semantics-aligned audio encoders progressively throw away paralinguistic information</h2>
+<p>An audio encoder aligned to a text LLM is trained to keep what was said. On MAEB, the LLM-backed embedders score 95 to 99% on multilingual text-to-audio retrieval, but only 1 to 6% on unsupervised audio clustering and around 20% on vocal emotion recognition. Voice, pitch, emotion and sound texture do not survive in the final layers.</p>
+<p><a href="https://arxiv.org/abs/2603.08312">Bouziane, Mdhaffar and Estève</a> make the same point about speech encoders aligned only with semantic embeddings, whose paralinguistic information may be suppressed. Their work is what motivated this experiment.</p>
+<p>The information survives in the earlier layers. Other encoders show it: different attributes (speaker, emotion, content) live at different depths (<a href="https://arxiv.org/abs/2107.04734">Pasad et al.</a>, <a href="https://arxiv.org/abs/2610.21941">Bouziane et al.</a>). I probed the 12 Conformer layers of EmbeddingGemma-2 one by one, and found the same:</p>
+<ul>
+<li><strong>Layer 2</strong> carries the speaker. Gender clustering on VoxPopuli goes from 0.05% at the final output to about 65%.</li>
+<li><strong>Layer 6</strong> carries the emotion. Emotion classification on CREMA-D doubles, from 19.7% to 39.5%.</li>
+</ul>
+</section>
+<section id="free-dimensions" class="level2">
+<h2 class="anchored" data-anchor-id="free-dimensions">256 free dimensions</h2>
+<p>The text backbone of EmbeddingGemma-2 works in 512 dimensions, and a final linear layer expands its output to 768. This is a strange characteristic of the model: a 512-dimensional signal is stretched into a 768-dimensional vector, so every text embedding only occupies a 512-dimensional slice of the space. The other 256 directions, which a simple matrix decomposition (an SVD) gives exactly, are never used by text.</p>
+<p>That is what allows adding information for free in the final embedding. Anything written along those 256 directions has a zero dot product with every text embedding, so it cannot change how a text matches an audio clip or another text. Text embeddings receive nothing at all.</p>
+</section>
+<section id="zero-training" class="level2">
+<h2 class="anchored" data-anchor-id="zero-training">Zero training</h2>
+<ol type="1">
+<li>Pool layer 2 (mean and standard deviation over time) and layer 6 (mean) of the audio encoder.</li>
+<li>Reduce each to 128 dimensions with a PCA, softly whitened, and concatenate them into 256 dimensions.</li>
+<li>Write this vector along the 256 free directions, add it to the usual embedding of the clip, then normalize.</li>
+</ol>
+<p>The PCA is fitted on 1,400 clips, 350 from each of four external datasets with clips capped at 10 seconds: <a href="https://huggingface.co/datasets/ylacombe/expresso">Expresso</a> (expressive speech), <a href="https://huggingface.co/datasets/agkphysics/AudioSet">AudioSet</a> (audio events), <a href="https://huggingface.co/datasets/lewtun/music_genres">music_genres</a> (music) and <a href="https://huggingface.co/datasets/ashraq/esc50">ESC-50</a> (environmental sounds). No MAEB audio is used. Text embeddings are bit-for-bit unchanged, and text-to-audio retrieval in 100+ languages stays within 0.3 points of the base model.</p>
+</section>
+<section id="results" class="level2">
+<h2 class="anchored" data-anchor-id="results">Results</h2>
+<p>Audio-to-audio tasks, which are the ones the base model fails, gain the most:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Task</th>
+<th>Base</th>
+<th>With the head</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Gender clustering (VoxPopuli)</td>
+<td>0.05%</td>
+<td>63.1%</td>
+</tr>
+<tr class="even">
+<td>Gender classification (IEMOCAP)</td>
+<td>66.4%</td>
+<td>85.8%</td>
+</tr>
+<tr class="odd">
+<td>Emotion classification (CREMA-D)</td>
+<td>19.7%</td>
+<td>40.2%</td>
+</tr>
+<tr class="even">
+<td>Artist retrieval (Jamendo)</td>
+<td>55.2%</td>
+<td>93.8%</td>
+</tr>
+<tr class="odd">
+<td>Environmental sounds (FSD2019)</td>
+<td>38.8%</td>
+<td>56.3%</td>
+</tr>
+<tr class="even">
+<td>Music genre (GTZAN)</td>
+<td>57.7%</td>
+<td>71.5%</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="conclusion" class="level2">
+<h2 class="anchored" data-anchor-id="conclusion">Conclusion</h2>
+<p>This small experiment, with no training at all, belongs to a line of research that is already active: keeping several kinds of information in one speech encoder, as in Bouziane et al.&nbsp;(<a href="https://arxiv.org/abs/2603.08312">semantic and speaker</a>, <a href="https://arxiv.org/abs/2610.21941">multi-attribute distillation</a>). Here the idea is applied to a recent and very strong embedding model. It shows how much information a semantics-aligned audio encoder throws away in its final layers, and how easily the intermediate layers give it back.</p>
+</section>
+<section id="limits" class="level2">
+<h2 class="anchored" data-anchor-id="limits">Limits</h2>
+<ul>
+<li><strong>The numbers are optimistic.</strong> I chose the layers, the whitening and the strength of the injection by looking at the test scores, over a small grid. The PCA itself never saw MAEB, but the choice of configuration did.</li>
+<li><strong>Some tasks get worse.</strong> Spoken topic classification (SIBFLEURS) falls from 57.2% to 21.3%, spoken intent (MInDS14) from 97.6% to 88.3%, and spoken question answering (NMSQA) from 98.1% to 78.7%. The head adds noise for these tasks, which was expected given how crude the method is.</li>
+<li><strong>No Matryoshka truncation for audio.</strong> EmbeddingGemma-2 is trained so that its embedding can be cut to its first 512, 256 or 128 dimensions, for cheaper storage and search. The added acoustic part is spread over all 768 coordinates and only stays separate from the text directions when it is complete. Truncated audio embeddings would lose part of it, so audio needs all 768 dimensions.</li>
+</ul>
+<p>The model is on Hugging Face as <a href="https://huggingface.co/BrunoHays/embeddinggemma-2-nullspace-audio">BrunoHays/embeddinggemma-2-nullspace-audio</a>, with the per-task results for all 30 tasks. The official ranking is on the <a href="https://mteb-leaderboard.hf.space/benchmark/MAEB(v1)">MAEB leaderboard</a>.</p>
+
+
+</section>
+
+ ]]></description>
+  <guid>https://bruno-hays.github.io/posts/maeb-null-space-audio/</guid>
+  <pubDate>Wed, 11 Nov 2026 23:00:00 GMT</pubDate>
+  <media:content url="https://bruno-hays.github.io/posts/maeb-null-space-audio/thumbnail.png" medium="image" type="image/png" height="57" width="144"/>
+</item>
 <item>
   <title>Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting</title>
   <dc:creator>Bruno Hays</dc:creator>

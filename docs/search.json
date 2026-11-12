@@ -42,6 +42,55 @@
     "text": "Results\n\n\n\n\n\n\n\n\nPhone-number test set\nPhone errors\nEveryday WER (internal datasets)\n\n\n\n\nQwen3-ASR-1.7B (original)\n28.0%\n16.6%\n\n\nElevenLabs\n20.7%\n\n\n\nGemini 3.8 Flash, fixing the transcript with the audio\n19.8%\n\n\n\nSFT, decoder only\n23.4%\n16.8%\n\n\nSFT, decoder + audio encoder\n21.1%\n19.4%\n\n\nSFT, decoder + audio encoder + re-distillation\n20.9%\n16.2%\n\n\n\nThe final model is on par with ElevenLabs on phone numbers and with the original model on everyday WER. In the end RL was not even needed: the recipe that works contains none.\nOn our full test suite, which comprises more than 40 public and internal datasets in the seven languages, the final model is flat overall. WER per language, original model vs final model:\n\n\n\n\n\n\n\n\n\n\nLanguage\nPublic, original\nPublic, final\nInternal, original\nInternal, final\n\n\n\n\nEnglish\n5.9%\n6.0%\n7.6%\n7.8%\n\n\nFrench\n11.2%\n11.2%\n16.4%\n16.2%\n\n\nItalian\n7.9%\n8.1%\n18.3%\n18.4%\n\n\nSpanish\n4.6%\n4.8%\n12.7%\n12.9%\n\n\nGerman\n7.7%\n8.0%\n16.0%\n16.1%\n\n\nPortuguese\n8.3%\n8.7%\n16.8%\n16.9%\n\n\nDutch\n9.1%\n9.6%\n28.1%\n25.3%\n\n\nAverage, 7 languages\n7.8%\n8.1%\n16.6%\n16.2%\n\n\nRussian (not in training)\n5.2%\n5.2%\n\n\n\n\n\nThe degradation is very small, at most 0.5 points per language on the public datasets. Russian was not part of the training and does not move at all, which shows the model did not forget outside the languages it was trained on."
   },
   {
+    "objectID": "posts/maeb-null-space-audio/index.html",
+    "href": "posts/maeb-null-space-audio/index.html",
+    "title": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB",
+    "section": "",
+    "text": "Audio encoders aligned to text keep what was said and progressively throw away how it was said: the voice, the pitch, the emotion. That information is still there in their intermediate layers. To show it, I took EmbeddingGemma-2 (577M parameters), which embeds text, images, video and audio in the same 768-dimensional space, and wrote features from two intermediate layers of its audio encoder into 256 dimensions that text never uses, without training a single weight.\nOn MAEB, the 30-task audio benchmark of the MTEB leaderboard, the score goes from 49.3% to 54.4%. That moves the model from rank 16 to rank 1 on the full benchmark (from 26 to 1 on the audio-only one), ahead of 7B to 9B multimodal models.\nThe rank partly reflects the benchmark. MAEB averages many acoustic tasks on which semantic embedders score close to zero, so any acoustic signal brings large gains."
+  },
+  {
+    "objectID": "posts/maeb-null-space-audio/index.html#semantics-aligned-audio-encoders-progressively-throw-away-paralinguistic-information",
+    "href": "posts/maeb-null-space-audio/index.html#semantics-aligned-audio-encoders-progressively-throw-away-paralinguistic-information",
+    "title": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB",
+    "section": "Semantics-aligned audio encoders progressively throw away paralinguistic information",
+    "text": "Semantics-aligned audio encoders progressively throw away paralinguistic information\nAn audio encoder aligned to a text LLM is trained to keep what was said. On MAEB, the LLM-backed embedders score 95 to 99% on multilingual text-to-audio retrieval, but only 1 to 6% on unsupervised audio clustering and around 20% on vocal emotion recognition. Voice, pitch, emotion and sound texture do not survive in the final layers.\nBouziane, Mdhaffar and Estève make the same point about speech encoders aligned only with semantic embeddings, whose paralinguistic information may be suppressed. Their work is what motivated this experiment.\nThe information survives in the earlier layers. Other encoders show it: different attributes (speaker, emotion, content) live at different depths (Pasad et al., Bouziane et al.). I probed the 12 Conformer layers of EmbeddingGemma-2 one by one, and found the same:\n\nLayer 2 carries the speaker. Gender clustering on VoxPopuli goes from 0.05% at the final output to about 65%.\nLayer 6 carries the emotion. Emotion classification on CREMA-D doubles, from 19.7% to 39.5%."
+  },
+  {
+    "objectID": "posts/maeb-null-space-audio/index.html#free-dimensions",
+    "href": "posts/maeb-null-space-audio/index.html#free-dimensions",
+    "title": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB",
+    "section": "256 free dimensions",
+    "text": "256 free dimensions\nThe text backbone of EmbeddingGemma-2 works in 512 dimensions, and a final linear layer expands its output to 768. This is a strange characteristic of the model: a 512-dimensional signal is stretched into a 768-dimensional vector, so every text embedding only occupies a 512-dimensional slice of the space. The other 256 directions, which a simple matrix decomposition (an SVD) gives exactly, are never used by text.\nThat is what allows adding information for free in the final embedding. Anything written along those 256 directions has a zero dot product with every text embedding, so it cannot change how a text matches an audio clip or another text. Text embeddings receive nothing at all."
+  },
+  {
+    "objectID": "posts/maeb-null-space-audio/index.html#zero-training",
+    "href": "posts/maeb-null-space-audio/index.html#zero-training",
+    "title": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB",
+    "section": "Zero training",
+    "text": "Zero training\n\nPool layer 2 (mean and standard deviation over time) and layer 6 (mean) of the audio encoder.\nReduce each to 128 dimensions with a PCA, softly whitened, and concatenate them into 256 dimensions.\nWrite this vector along the 256 free directions, add it to the usual embedding of the clip, then normalize.\n\nThe PCA is fitted on 1,400 clips, 350 from each of four external datasets with clips capped at 10 seconds: Expresso (expressive speech), AudioSet (audio events), music_genres (music) and ESC-50 (environmental sounds). No MAEB audio is used. Text embeddings are bit-for-bit unchanged, and text-to-audio retrieval in 100+ languages stays within 0.3 points of the base model."
+  },
+  {
+    "objectID": "posts/maeb-null-space-audio/index.html#results",
+    "href": "posts/maeb-null-space-audio/index.html#results",
+    "title": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB",
+    "section": "Results",
+    "text": "Results\nAudio-to-audio tasks, which are the ones the base model fails, gain the most:\n\n\n\nTask\nBase\nWith the head\n\n\n\n\nGender clustering (VoxPopuli)\n0.05%\n63.1%\n\n\nGender classification (IEMOCAP)\n66.4%\n85.8%\n\n\nEmotion classification (CREMA-D)\n19.7%\n40.2%\n\n\nArtist retrieval (Jamendo)\n55.2%\n93.8%\n\n\nEnvironmental sounds (FSD2019)\n38.8%\n56.3%\n\n\nMusic genre (GTZAN)\n57.7%\n71.5%"
+  },
+  {
+    "objectID": "posts/maeb-null-space-audio/index.html#conclusion",
+    "href": "posts/maeb-null-space-audio/index.html#conclusion",
+    "title": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB",
+    "section": "Conclusion",
+    "text": "Conclusion\nThis small experiment, with no training at all, belongs to a line of research that is already active: keeping several kinds of information in one speech encoder, as in Bouziane et al. (semantic and speaker, multi-attribute distillation). Here the idea is applied to a recent and very strong embedding model. It shows how much information a semantics-aligned audio encoder throws away in its final layers, and how easily the intermediate layers give it back."
+  },
+  {
+    "objectID": "posts/maeb-null-space-audio/index.html#limits",
+    "href": "posts/maeb-null-space-audio/index.html#limits",
+    "title": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB",
+    "section": "Limits",
+    "text": "Limits\n\nThe numbers are optimistic. I chose the layers, the whitening and the strength of the injection by looking at the test scores, over a small grid. The PCA itself never saw MAEB, but the choice of configuration did.\nSome tasks get worse. Spoken topic classification (SIBFLEURS) falls from 57.2% to 21.3%, spoken intent (MInDS14) from 97.6% to 88.3%, and spoken question answering (NMSQA) from 98.1% to 78.7%. The head adds noise for these tasks, which was expected given how crude the method is.\nNo Matryoshka truncation for audio. EmbeddingGemma-2 is trained so that its embedding can be cut to its first 512, 256 or 128 dimensions, for cheaper storage and search. The added acoustic part is spread over all 768 coordinates and only stays separate from the text directions when it is complete. Truncated audio embeddings would lose part of it, so audio needs all 768 dimensions.\n\nThe model is on Hugging Face as BrunoHays/embeddinggemma-2-nullspace-audio, with the per-task results for all 30 tasks. The official ranking is on the MAEB leaderboard."
+  },
+  {
     "objectID": "posts/realtime-multilingual-asr-router/index.html",
     "href": "posts/realtime-multilingual-asr-router/index.html",
     "title": "Real-time multilingual ASR: route between small models",
@@ -137,6 +186,6 @@
     "href": "index.html",
     "title": "Articles",
     "section": "",
-    "text": "Cutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting\n\n\n\n\n\n\n\n\n\n\nOct 26, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nHow to fix dictated email addresses lost in real transcripts, at the cost of a few tokens per address\n\n\n\n\n\n\n\n\n\n\nAug 20, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nReal-time multilingual ASR: route between small models\n\n\n\nStreaming ASR falls apart at language switches. Instead of scaling one multilingual model, route between ~100M monolingual ones and roll back when the language changes.\n\n\n\n\n\n\nMay 29, 2026\n\n\nBruno Hays\n\n\n\n\n\nNo matching items"
+    "text": "Audio embeddings forget the voice: recovering it from intermediate layers takes EmbeddingGemma-2 to rank 1 on MAEB\n\n\n\n\n\n\n\n\n\n\nNov 12, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nCutting Qwen3-ASR-1.7B’s phone-number errors by 25% with minimal forgetting\n\n\n\n\n\n\n\n\n\n\nOct 26, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nHow to fix dictated email addresses lost in real transcripts, at the cost of a few tokens per address\n\n\n\n\n\n\n\n\n\n\nAug 20, 2026\n\n\nBruno Hays\n\n\n\n\n\n\n\n\n\n\n\n\nReal-time multilingual ASR: route between small models\n\n\n\nStreaming ASR falls apart at language switches. Instead of scaling one multilingual model, route between ~100M monolingual ones and roll back when the language changes.\n\n\n\n\n\n\nMay 29, 2026\n\n\nBruno Hays\n\n\n\n\n\nNo matching items"
   }
 ]
