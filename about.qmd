@@ -4,9 +4,14 @@ image: profile.jpg
 about:
   template: jolla
   links:
+    - icon: linkedin
+      text: LinkedIn
+      href: https://www.linkedin.com/in/bruno-hays/
     - icon: github
       text: GitHub
       href: https://github.com/bruno-hays
+    - text: "🤗 Hugging Face"
+      href: https://huggingface.co/BrunoHays
 ---
 
-Machine learning engineer. This blog collects interesting things I have worked on.
+Lead ML speech engineer at Gladia. This blog collects interesting things I have worked on.
